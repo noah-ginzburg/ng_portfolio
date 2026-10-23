@@ -186,11 +186,12 @@
           <svg class="mini" viewBox="0 0 200 130" aria-hidden="true">
             <g class="tgt" transform="translate(45 26)"><circle r="10"/><circle r="3" class="dot"/></g>
             <g class="tgt" transform="translate(155 26)"><circle r="10"/><circle r="3" class="dot"/></g>
-            <g class="ring" transform="translate(100 92)" data-bumps="45,26 155,26" data-strength="0.75"></g>
+            <path class="trail dashed" d="M100 66 V36"/>
+            <g class="ring" transform="translate(100 92)" data-bumps="100,26" data-strength="1"></g>
             <g class="quad" transform="translate(100 92)"><path d="M-8 -8L8 8M8 -8L-8 8"/><circle cx="-8" cy="-8" r="3.5"/><circle cx="8" cy="-8" r="3.5"/><circle cx="-8" cy="8" r="3.5"/><circle cx="8" cy="8" r="3.5"/></g>
           </svg>
           <p class="mono-label">2 · How flies do it</p>
-          <p>A fly tracks its heading with a ring of neurons. Neighbours excite, rivals inhibit, and one bump of activity wins. Two targets means two bumps fighting.</p>
+          <p>A fly tracks its heading with a ring of neurons: neighbours excite, distant ones inhibit, and one bump of activity forms. While two targets are close together, that bump sits between them.</p>
         </li>
         <li>
           <svg class="mini" viewBox="0 0 200 130" aria-hidden="true">
@@ -201,7 +202,7 @@
             <g class="quad" transform="translate(100 92)"><path d="M-8 -8L8 8M8 -8L-8 8"/><circle cx="-8" cy="-8" r="3.5"/><circle cx="8" cy="-8" r="3.5"/><circle cx="-8" cy="8" r="3.5"/><circle cx="8" cy="8" r="3.5"/></g>
           </svg>
           <p class="mono-label">3 · What I built</p>
-          <p>A ring only covers a flat circle, and drones fly in 3D. So I wrapped it around a sphere where every point is a direction in space, and flew it.</p>
+          <p>As the targets spread apart, the average becomes unstable and the bump splits off to one of them. I wrapped the ring around a sphere so this works in 3D, and flew it.</p>
         </li>
         <li>
           <svg class="mini" viewBox="0 0 200 130" aria-hidden="true">
@@ -318,7 +319,7 @@
           <span>Spherical attractor · live</span>
           <span class="sim-status" id="sim-status">Competing</span>
         </div>
-        <canvas id="sphere" role="img" aria-label="Animation: three targets compete on a sphere of neurons until one direction wins"></canvas>
+        <canvas id="sphere" role="img" aria-label="Animation: a bump of activity on a sphere of neurons first averages three targets, then splits off and commits to one as they spread apart"></canvas>
         <div class="sim-bars" id="sim-bars" aria-hidden="true">
           <div class="bar"><span>A</span><i><b></b></i><em>0.00</em></div>
           <div class="bar"><span>B</span><i><b></b></i><em>0.00</em></div>
@@ -329,7 +330,7 @@
       <div class="showcase-text">
         <p class="badges"><span class="badge badge-blue">Live demo</span><span class="badge">The model behind the drone</span></p>
         <h2>Watch a decision happen</h2>
-        <p>Every dot is a neuron pointing in one 3D direction. Three targets light up their patch of the sphere, neighbours reinforce, rivals suppress, and within seconds one direction takes over. That's the moment the drone commits.</p>
+        <p>Every dot is a neuron pointing in one 3D direction, running the same equations as on the drone. While the three targets are close together, the network averages them into one bump and the heading points between them. As they spread apart, like a drone flying towards them, that average becomes unstable: the bump splits off and commits to one target.</p>
         <p>In a swarm, each robot would run its own copy, with the other robots as its targets. That's how the 2D version gets a whole group to flock together.</p>
 
         <div class="controls">
@@ -343,7 +344,7 @@
           </div>
         </div>
 
-        <p class="note">A simplified version running live in your browser. The real model runs as a ROS&nbsp;2 node and steers Crazyflies under motion capture.</p>
+        <p class="note">The same model as the research code, scaled down to 480 neurons so it runs in your browser. On the drones it runs as a ROS&nbsp;2 node under motion capture.</p>
 
         <div class="actions">
           <a class="link" href="#drone">See it on the drone ↑</a>

@@ -306,10 +306,13 @@ function backgroundSwarm(canvas) {
 }
 
 // ---------------------------------------------------------------------------
-// Live demo: a toy version of the spherical attractor network.
-// Points on a sphere are "neurons", each standing for one 3D direction.
-// Three targets compete (winner-take-all); noise breaks the tie,
-// one bump of activity wins, and the heading arrow commits to it.
+// Live demo: the spherical attractor network from the drone project, running for real.
+// Same equations as the research notebook: N neurons spread over a sphere, each one a
+// 3D direction; nearby neurons excite each other and distant ones inhibit each other
+// (kernel cos(pi * (alpha/pi)^v) / N), and each target feeds in a bump of input.
+// While the targets are close together the network averages them into one bump. As
+// they spread apart (like a drone flying towards them) the average becomes unstable,
+// and the bump splits off and commits to one target.
 // ---------------------------------------------------------------------------
 function attractorSphere(canvas) {
   if (!canvas) return;
@@ -319,23 +322,53 @@ function attractorSphere(canvas) {
   const sliders = [0, 1, 2].map(k => document.getElementById(`q${k}`));
   const quality = () => sliders.map(s => (s ? Number(s.value) : 1));
 
-  const N = 1500;           // neurons on the sphere
-  const BUMP_WIDTH = 0.055; // smaller = tighter activity bumps
-  const GROWTH = 3.0;       // how fast the competition plays out
-  const INHIBITION = 2.5;   // > 1 means only one target can survive
-  const NOISE = 0.09;
-  const TILT = 0.42;        // camera looks slightly down on the sphere
-  const SPIN = 0.06;        // rotation speed, radians per second
+  // Model parameters, as in the notebook
+  const N = 480;           // neurons
+  const V = 0.5;           // kernel shape
+  const U = 35;            // recurrent gain
+  const BETA = 1.5;
+  const KAPPA = 10;        // how narrow each target's input is
+  const Q = 20;            // target quality with the slider at full
+  const SIGMA = 1.0;       // noise
+  const DT = 0.1;
+  const STEPS_PER_SECOND = 480;
+  // How the demo plays out: the targets start 20° from their centre and spread to 62°
+  const CONE_START = 20, CONE_END = 62, RAMP_STEPS = 2000;
+  const COMMIT_DEG = 6;    // heading this close to a target counts as committed
+  const TILT = 0.42;       // camera looks slightly down on the sphere
+  const SPIN = 0.03;       // rotation speed, radians per second
   const LABELS = ['A', 'B', 'C'];
 
-  // Evenly spread points on a sphere (Fibonacci lattice).
-  const points = [];
-  const golden = Math.PI * (3 - Math.sqrt(5));
+  // The network: neuron directions and the connection matrix between every pair.
+  const nodes = fibonacciSphere(N);
+  const M = new Float32Array(N * N);
   for (let i = 0; i < N; i++) {
-    const y = 1 - (i / (N - 1)) * 2;
-    const r = Math.sqrt(1 - y * y);
-    points.push([Math.cos(golden * i) * r, y, Math.sin(golden * i) * r]);
+    for (let j = 0; j < N; j++) {
+      const alpha = Math.acos(Math.max(-1, Math.min(1, dot(nodes[i], nodes[j]))));
+      M[i * N + j] = Math.cos(Math.PI * Math.pow(alpha / Math.PI, V)) / N;
+    }
   }
+  const z = new Float32Array(N);       // activity of each neuron
+  const input = new Float32Array(N);   // sensory input from the targets
+  const offset = Math.tanh(-BETA);
+
+  // What you see: a denser set of dots, each coloured from its 3 nearest neurons.
+  const dots = fibonacciSphere(1500).map(p => {
+    const idx = [0, 0, 0], best = [-2, -2, -2];
+    for (let i = 0; i < N; i++) {
+      const d = dot(p, nodes[i]);
+      for (let k = 0; k < 3; k++) {
+        if (d > best[k]) {
+          best.splice(k, 0, d); best.length = 3;
+          idx.splice(k, 0, i); idx.length = 3;
+          break;
+        }
+      }
+    }
+    const w = best.map(d => 1 / (Math.acos(Math.min(1, d)) + 0.02));
+    const sum = w[0] + w[1] + w[2];
+    return { p, idx, w: w.map(x => x / sum) };
+  });
 
   // Globe lines: 6 meridians and 5 parallels, sampled as points.
   const wires = [];
@@ -354,45 +387,100 @@ function attractorSphere(canvas) {
   const colours = Array.from({ length: STEPS }, (_, i) => rampColour(RAMP, i / (STEPS - 1)));
   const glows = colours.map(makeGlow);
 
-  let targets, weights, phase, phaseTime, winner, arrow;
   let angle = 0.5;
+  let centre, frame, spin0, labels, targets, steps, phase, phaseTime, winner;
+  let heading = [0, 0, 1], strength = 0, support = [1 / 3, 1 / 3, 1 / 3];
 
+  // New trial: the targets' centre points sideways and towards the viewer, so the
+  // averaged heading is easy to see, and one target sits on the side facing you.
   function reset() {
-    targets = pickTargets(3, angle, TILT);
-    weights = [0, 0, 0];
-    phase = 'appear';
-    phaseTime = 0;
-    winner = -1;
-    arrow = 0;
+    const side = Math.random() * Math.PI * 2;
+    const c = normalize([0.7 * Math.cos(side), 0.7 * Math.sin(side), 0.71]);
+    const towardViewer = normalize([-c[0] * c[2], -c[1] * c[2], 1 - c[2] * c[2]]);
+    centre = unrotate(c, angle, TILT);
+    const e1 = unrotate(towardViewer, angle, TILT);
+    frame = [e1, cross(centre, e1)];
+    spin0 = (Math.random() - 0.5) * 0.6;
+    labels = shuffle([0, 1, 2]);
+    z.fill(0);
+    steps = 0; phase = 'run'; phaseTime = 0; winner = -1; strength = 0;
+    placeTargets();
   }
 
-  // Competitive dynamics: each target's strength grows towards its quality and is
-  // suppressed by the others. Equal qualities mean only noise decides the winner.
-  const W0 = 1 / (1 + 2 * INHIBITION); // the balanced (unstable) starting point
-  function step(dt) {
-    phaseTime += dt;
+  // Put the targets on a cone around the centre and recompute their input.
+  function placeTargets() {
+    const th = (CONE_START + (CONE_END - CONE_START) * Math.min(1, steps / RAMP_STEPS)) * Math.PI / 180;
+    const [e1, e2] = frame;
+    targets = [0, 1, 2].map(k => {
+      const a = spin0 + (k * 2 * Math.PI) / 3;
+      return normalize([0, 1, 2].map(i => Math.cos(th) * centre[i] + Math.sin(th) * (Math.cos(a) * e1[i] + Math.sin(a) * e2[i])));
+    });
     const q = quality();
-    if (phase === 'appear') {
-      const k = Math.min(1, phaseTime / 0.9);
-      weights = weights.map(() => W0 * k * k * (3 - 2 * k));
-      if (k >= 1) { phase = 'compete'; phaseTime = 0; }
-    } else if (phase === 'compete') {
-      const total = weights.reduce((a, b) => a + b, 0);
-      weights = weights.map((w, k) => {
-        const dw = GROWTH * w * (q[k] - w - INHIBITION * (total - w));
-        return Math.max(0.0005, w + dw * dt + NOISE * Math.sqrt(dt) * gaussian() * w);
-      });
-      const order = weights.map((w, i) => i).sort((a, b) => weights[b] - weights[a]);
-      if (weights[order[0]] > 0.9 * q[order[0]] && weights[order[1]] < 0.04) {
-        phase = 'commit'; phaseTime = 0; winner = order[0];
-      }
-    } else if (phase === 'commit') {
-      arrow = Math.min(1, arrow + dt / 0.5);
-      if (phaseTime > 3.2) { phase = 'fade'; phaseTime = 0; }
-    } else if (phase === 'fade') {
-      weights = weights.map(w => w * Math.exp(-4 * dt));
-      arrow = Math.max(0, arrow - dt / 0.6);
-      if (phaseTime > 1.1) reset();
+    for (let i = 0; i < N; i++) {
+      let b = 0;
+      for (let k = 0; k < 3; k++) b += Q * q[labels[k]] * Math.exp(KAPPA * (dot(nodes[i], targets[k]) - 1));
+      input[i] = b / Math.sqrt(N);
+    }
+  }
+
+  // One Euler step of dz/dt = -z + tanh(u * M z + b - beta) - tanh(-beta), plus noise.
+  const drive = new Float32Array(N);
+  function simStep() {
+    for (let i = 0; i < N; i++) {
+      let s = 0;
+      const row = i * N;
+      for (let j = 0; j < N; j++) s += M[row + j] * z[j];
+      drive[i] = s;
+    }
+    const noise = SIGMA * Math.sqrt(DT) / Math.sqrt(N);
+    for (let i = 0; i < N; i++) {
+      z[i] += DT * (-z[i] + Math.tanh(U * drive[i] + input[i] - BETA) - offset) + noise * gaussian();
+    }
+    steps++;
+  }
+
+  // Heading = activity-weighted average direction (what the drone would fly towards),
+  // and how much of the activity sits on each target.
+  function measure() {
+    let hx = 0, hy = 0, hz = 0;
+    const s = [0, 0, 0];
+    for (let i = 0; i < N; i++) {
+      const a = z[i];
+      if (a <= 0) continue;
+      const n = nodes[i];
+      hx += a * n[0]; hy += a * n[1]; hz += a * n[2];
+      for (let k = 0; k < 3; k++) s[k] += a * Math.exp(KAPPA * (dot(n, targets[k]) - 1));
+    }
+    strength = Math.hypot(hx, hy, hz);
+    if (strength > 1e-6) heading = [hx / strength, hy / strength, hz / strength];
+    const total = s[0] + s[1] + s[2];
+    support = total > 0 ? s.map(x => x / total) : [1 / 3, 1 / 3, 1 / 3];
+  }
+
+  const degreesTo = t => (Math.acos(Math.min(1, dot(heading, t))) * 180) / Math.PI;
+
+  function advance(dt) {
+    phaseTime += dt;
+    if (phase === 'fade') {
+      const k = Math.exp(-4 * dt);
+      for (let i = 0; i < N; i++) z[i] *= k;
+      measure();
+      if (phaseTime > 1) reset();
+      return;
+    }
+    const n = Math.min(12, Math.max(1, Math.round(dt * STEPS_PER_SECOND)));
+    for (let s = 0; s < n; s++) {
+      if (steps % 10 === 0) placeTargets();
+      simStep();
+    }
+    measure();
+    if (phase === 'run') {
+      const errs = targets.map(degreesTo);
+      const best = errs.indexOf(Math.min(...errs));
+      if (steps > 600 && errs[best] < COMMIT_DEG) { phase = 'commit'; phaseTime = 0; winner = best; }
+      else if (steps > RAMP_STEPS + 4000) { phase = 'fade'; phaseTime = 0; }
+    } else if (phase === 'commit' && phaseTime > 3.2) {
+      phase = 'fade'; phaseTime = 0;
     }
   }
 
@@ -416,16 +504,12 @@ function attractorSphere(canvas) {
     ctx.fillStyle = halo;
     ctx.fillRect(0, 0, w, h);
 
-    // Activity of every neuron (display uses the square root so faint bumps stay visible).
-    const shown = weights.map(Math.sqrt);
+    // Each dot's activity, blended from its nearest neurons (activity tops out near 2).
     const back = [], front = [];
-    let hx = 0, hy = 0, hz = 0, sum = 0;
-    for (const p of points) {
-      let a = 0;
-      for (let k = 0; k < 3; k++) a += shown[k] * Math.exp((dot(p, targets[k]) - 1) / BUMP_WIDTH);
-      const q = view(p);
-      hx += a * q[0]; hy += a * q[1]; hz += a * q[2]; sum += a;
-      (q[2] < 0 ? back : front).push([q, Math.min(1, a)]);
+    for (const d of dots) {
+      const a = d.w[0] * z[d.idx[0]] + d.w[1] * z[d.idx[1]] + d.w[2] * z[d.idx[2]];
+      const q = view(d.p);
+      (q[2] < 0 ? back : front).push([q, Math.max(0, Math.min(1, a / 2.2))]);
     }
 
     // Back half first, then a translucent sphere body over it, then the front half.
@@ -443,8 +527,7 @@ function attractorSphere(canvas) {
     drawWires(true);
     drawNeurons(front);
 
-    // Target markers, just outside the sphere along each target's direction.
-    // The ring around each marker grows with its quality slider.
+    // Target markers just outside the sphere; the ring grows with the quality slider.
     ctx.font = `500 ${11 * unit}px "IBM Plex Mono", monospace`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
@@ -452,25 +535,25 @@ function attractorSphere(canvas) {
     targets.forEach((t, k) => {
       const q = view(t);
       const depth = (q[2] + 1) / 2;
-      const won = k === winner;
+      const won = k === winner && phase !== 'fade';
       const x = cx + q[0] * R * 1.14, y = cy - q[1] * R * 1.14;
       const ink = won ? '#67e8f9' : 'rgba(214,228,255,0.85)';
       ctx.globalAlpha = 0.3 + 0.7 * depth;
       ctx.strokeStyle = ink;
       ctx.fillStyle = ink;
       ctx.lineWidth = 1.3 * unit;
-      ctx.beginPath(); ctx.arc(x, y, (3 + 5 * qual[k]) * unit, 0, Math.PI * 2); ctx.stroke();
+      ctx.beginPath(); ctx.arc(x, y, (3 + 5 * qual[labels[k]]) * unit, 0, Math.PI * 2); ctx.stroke();
       ctx.beginPath(); ctx.arc(x, y, (won ? 3 : 1.8) * unit, 0, Math.PI * 2); ctx.fill();
-      ctx.fillText(LABELS[k], cx + q[0] * R * 1.3, cy - q[1] * R * 1.3);
+      ctx.fillText(LABELS[labels[k]], cx + q[0] * R * 1.3, cy - q[1] * R * 1.3);
     });
     ctx.globalAlpha = 1;
 
-    // Heading arrow: the population vector of all neurons, drawn once the network commits.
-    if (arrow > 0 && sum > 0) {
-      const len = Math.hypot(hx, hy, hz);
-      const ux = hx / len, uy = hy / len;
-      const L = R * 1.02 * easeOut(arrow);
-      const tx = cx + ux * L, ty = cy - uy * L;
+    // Heading arrow: the activity-weighted average direction, shown as soon as a bump exists.
+    const show = Math.min(1, strength / 15);
+    if (show > 0.02) {
+      const q = view(heading);
+      const tx = cx + q[0] * R * 1.02, ty = cy - q[1] * R * 1.02;
+      ctx.globalAlpha = show;
       const grad = ctx.createLinearGradient(cx, cy, tx, ty);
       grad.addColorStop(0, 'rgba(236,252,255,0.2)');
       grad.addColorStop(1, 'rgba(236,252,255,1)');
@@ -486,6 +569,7 @@ function attractorSphere(canvas) {
       ctx.lineTo(tx + Math.cos(ang - 2.5) * head, ty + Math.sin(ang - 2.5) * head);
       ctx.closePath(); ctx.fill();
       ctx.beginPath(); ctx.arc(cx, cy, 3 * unit, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1;
     }
 
     function drawWires(isFront) {
@@ -518,13 +602,14 @@ function attractorSphere(canvas) {
       for (const [q, a] of list) {
         if (a <= 0.05) continue;
         const depth = (q[2] + 1) / 2;
-        const i = Math.round(a * (STEPS - 1));
-        const g = unit * (6 + 14 * a) * (0.6 + 0.6 * depth);
-        ctx.globalAlpha = Math.min(1, a * 1.3) * (0.18 + 0.5 * depth);
+        // The real bump is wide and flat-topped, so keep the glow soft and stop short of white.
+        const i = Math.round(a * 0.86 * (STEPS - 1));
+        const g = unit * (4 + 8 * a) * (0.6 + 0.6 * depth);
+        ctx.globalAlpha = a * (0.1 + 0.3 * depth);
         ctx.drawImage(glows[i], sx(q) - g, sy(q) - g, g * 2, g * 2);
         ctx.globalAlpha = 0.35 + 0.65 * depth;
         ctx.fillStyle = colours[i].css;
-        const r = unit * (0.8 + 1.5 * a) * (0.7 + 0.5 * depth);
+        const r = unit * (0.8 + 1.1 * a) * (0.7 + 0.5 * depth);
         ctx.beginPath(); ctx.arc(sx(q), sy(q), r, 0, Math.PI * 2); ctx.fill();
       }
       ctx.globalCompositeOperation = 'source-over';
@@ -532,18 +617,20 @@ function attractorSphere(canvas) {
     }
   }
 
-  // Status text and the A/B/C strength bars under the canvas.
+  // Status text, and the share of activity sitting on each target (A, B, C).
   let lastHud = '';
   function updateHud() {
-    const status =
-      phase === 'appear' ? 'Targets sensed' :
-      phase === 'compete' ? 'Competing' :
-      phase === 'commit' ? `Committed → ${LABELS[winner]}` : 'Resetting';
+    let status;
+    if (phase === 'fade') status = 'Resetting';
+    else if (phase === 'commit') status = `Committed → ${LABELS[labels[winner]]}`;
+    else if (strength < 2) status = 'Targets sensed';
+    else status = degreesTo(centre) < 6 ? 'Averaging A, B, C' : 'Splitting';
     if (status !== lastHud && statusEl) { statusEl.textContent = status; lastHud = status; }
     bars.forEach((bar, k) => {
-      bar.querySelector('b').style.width = `${Math.min(100, weights[k] * 100)}%`;
-      bar.querySelector('em').textContent = weights[k].toFixed(2);
-      bar.classList.toggle('win', k === winner && phase !== 'fade');
+      const t = labels.indexOf(k);           // which target carries label k
+      bar.querySelector('b').style.width = `${(support[t] * 100).toFixed(1)}%`;
+      bar.querySelector('em').textContent = support[t].toFixed(2);
+      bar.classList.toggle('win', phase === 'commit' && winner === t);
     });
   }
 
@@ -554,11 +641,12 @@ function attractorSphere(canvas) {
     draw();
   }
 
-  // With reduced motion: jump straight to a decision and draw one still frame.
+  // With reduced motion: start with the targets fully spread, run to a decision, draw one frame.
   function settle() {
     reset();
-    for (let i = 0; i < 6000 && phase !== 'commit'; i++) step(0.02);
-    arrow = 1;
+    steps = RAMP_STEPS;
+    placeTargets();
+    for (let i = 0; i < 1500 && phase === 'run'; i++) advance(1 / 480);
     draw();
     updateHud();
   }
@@ -569,7 +657,7 @@ function attractorSphere(canvas) {
     last = now;
     if (visible && !document.hidden) {
       angle += dt * SPIN;
-      step(dt);
+      advance(dt);
       draw();
       updateHud();
     }
@@ -584,7 +672,7 @@ function attractorSphere(canvas) {
     sliders.forEach(s => { if (s) s.value = 1; });
     restart();
   });
-  // Moving a slider restarts the contest with the new qualities.
+  // Moving a slider restarts the trial with the new qualities.
   sliders.forEach(s => s?.addEventListener('change', restart));
 
   if (reduceMotion) {
@@ -626,16 +714,31 @@ function circle(f, n = 72) {
   return Array.from({ length: n }, (_, i) => f((i / n) * Math.PI * 2));
 }
 
-// Targets spread roughly 120° apart around the visible rim, tipped slightly towards
-// the viewer, so each bump and the final arrow are easy to see.
-function pickTargets(n, yaw, pitch) {
-  const base = Math.random() * Math.PI * 2;
-  return Array.from({ length: n }, (_, k) => {
-    const az = base + (k * 2 * Math.PI) / n + (Math.random() - 0.5) * 0.5;
-    const z = 0.2 + Math.random() * 0.3;
-    const r = Math.sqrt(1 - z * z);
-    return unrotate([r * Math.cos(az), r * Math.sin(az), z], yaw, pitch);
+// Evenly spread points on a sphere (Fibonacci lattice).
+function fibonacciSphere(n) {
+  const golden = Math.PI * (3 - Math.sqrt(5));
+  return Array.from({ length: n }, (_, i) => {
+    const y = 1 - (i / (n - 1)) * 2;
+    const r = Math.sqrt(1 - y * y);
+    return [Math.cos(golden * i) * r, y, Math.sin(golden * i) * r];
   });
+}
+
+function normalize(v) {
+  const len = Math.hypot(v[0], v[1], v[2]) || 1;
+  return [v[0] / len, v[1] / len, v[2] / len];
+}
+
+function cross(a, b) {
+  return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+}
+
+function shuffle(list) {
+  for (let i = list.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [list[i], list[j]] = [list[j], list[i]];
+  }
+  return list;
 }
 
 function rampColour(stops, t) {
